@@ -1131,6 +1131,9 @@ static void add_ddir_status_json(struct thread_stat *ts,
 	json_object_add_value_int(tmp_object, "max", max);
 	json_object_add_value_float(tmp_object, "mean", mean);
 	json_object_add_value_float(tmp_object, "stddev", dev);
+	json_object_add_value_int(tmp_object, "samples",
+				(&ts->lat_stat[ddir])->samples);
+
 	if (ts->lat_percentiles)
 		json_object_add_value_object(tmp_object, "percentile", percentile_object);
 	if (output_format & FIO_OUTPUT_JSON_PLUS && ts->lat_percentiles)

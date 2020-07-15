@@ -25,3 +25,6 @@ lex.yy.c
 doc/output
 /tags
 /TAGS
+
+# IDE
+.vscode/
