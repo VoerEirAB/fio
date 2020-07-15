@@ -1136,6 +1136,8 @@ static void add_ddir_status_json(struct thread_stat *ts,
 	if (output_format & FIO_OUTPUT_JSON_PLUS && ts->lat_percentiles)
 		json_object_add_value_object(tmp_object, "bins", clat_bins_object);
 
+	json_object_add_value_int(tmp_object, "samples",
+				(&ts->lat_stat[ddir])->samples);
 	if (ovals)
 		free(ovals);
 
