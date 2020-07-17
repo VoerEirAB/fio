@@ -1055,6 +1055,8 @@ static void add_ddir_status_json(struct thread_stat *ts,
 	json_object_add_value_int(tmp_object, "max", max);
 	json_object_add_value_float(tmp_object, "mean", mean);
 	json_object_add_value_float(tmp_object, "stddev", dev);
+	json_object_add_value_int(tmp_object, "samples",
+				(&ts->lat_stat[ddir])->samples);
 	if (ovals)
 		free(ovals);
 
