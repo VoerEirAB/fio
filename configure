@@ -382,6 +382,8 @@ CYGWIN*)
   sched_idle="yes"
   tcp_nodelay="yes"
   ipv6="yes"
+  pthread_condattr_setclock="no"
+  pthread_affinity="no"
   ;;
 esac
 
@@ -689,6 +691,71 @@ if compile_prog "" "$LIBS" "posix_pshared" ; then
   posix_pshared=yes
 fi
 print_config "POSIX pshared support" "$posix_pshared"
+
+##########################################
+# POSIX pthread_condattr_setclock() probe
+if test "$pthread_condattr_setclock" != "no" ; then
+  cat > $TMPC <<EOF
+#include <pthread.h>
+int main(void)
+{
+  pthread_condattr_t condattr;
+  pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC);
+  return 0;
+}
+EOF
+  if compile_prog "" "$LIBS" "pthread_condattr_setclock" ; then
+    pthread_condattr_setclock=yes
+  elif compile_prog "" "$LIBS -lpthread" "pthread_condattr_setclock" ; then
+    pthread_condattr_setclock=yes
+    LIBS="$LIBS -lpthread"
+  fi
+fi
+print_config "pthread_condattr_setclock()" "$pthread_condattr_setclock"
+
+##########################################
+# pthread_sigmask() probe
+if test "$pthread_sigmask" != "yes" ; then
+  pthread_sigmask="no"
+fi
+cat > $TMPC <<EOF
+#include <stddef.h> /* NULL */
+#include <signal.h> /* pthread_sigmask() */
+int main(void)
+{
+  return pthread_sigmask(0, NULL, NULL);
+}
+EOF
+if compile_prog "" "$LIBS" "pthread_sigmask" ; then
+  pthread_sigmask=yes
+elif compile_prog "" "$LIBS -lpthread" "pthread_sigmask" ; then
+  pthread_sigmask=yes
+  LIBS="$LIBS -lpthread"
+fi
+print_config "pthread_sigmask()" "$pthread_sigmask"
+
+##########################################
+# pthread_getaffinity_np() probe
+if test "$pthread_getaffinity" != "yes" ; then
+  pthread_getaffinity="no"
+fi
+cat > $TMPC <<EOF
+#include <stddef.h> /* NULL */
+#include <signal.h> /* pthread_sigmask() */
+#include <pthread.h>
+int main(void)
+{
+  cpu_set_t set;
+  return pthread_getaffinity_np(pthread_self(), sizeof(set), &set);
+}
+EOF
+if compile_prog "" "$LIBS" "pthread_getaffinity" ; then
+  pthread_getaffinity="yes"
+elif compile_prog "" "$LIBS -lpthread" "pthread_getaffinity" ; then
+  pthread_getaffinity="yes"
+  LIBS="$LIBS -lpthread"
+fi
+print_config "pthread_getaffinity_np()" "$pthread_getaffinity"
 
 ##########################################
 # solaris aio probe
@@ -2437,6 +2504,15 @@ if test "$posix_aio_fsync" = "yes" ; then
 fi
 if test "$posix_pshared" = "yes" ; then
   output_sym "CONFIG_PSHARED"
+fi
+if test "$pthread_condattr_setclock" = "yes" ; then
+  output_sym "CONFIG_PTHREAD_CONDATTR_SETCLOCK"
+fi
+if test "$pthread_sigmask" = "yes" ; then
+  output_sym "CONFIG_PTHREAD_SIGMASK"
+fi
+if test "$pthread_getaffinity" = "yes" ; then
+  output_sym "CONFIG_PTHREAD_GETAFFINITY"
 fi
 if test "$have_asprintf" = "yes" ; then
     output_sym "CONFIG_HAVE_ASPRINTF"
