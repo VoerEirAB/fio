@@ -659,6 +659,15 @@ int fio_monotonic_clocktest(int debug)
 	struct clock_entry *prev, *this;
 	uint32_t seq = 0;
 	unsigned int i;
+	os_cpu_mask_t mask;
+
+#ifdef CONFIG_PTHREAD_GETAFFINITY
+	fio_get_thread_affinity(mask);
+#else
+	memset(&mask, 0, sizeof(mask));
+	for (i = 0; i < nr_cpus; i++)
+		fio_cpu_set(&mask, i);
+#endif
 
 	if (debug) {
 		log_info("cs: reliable_tsc: %s\n", tsc_reliable ? "yes" : "no");
@@ -688,6 +697,8 @@ int fio_monotonic_clocktest(int debug)
 	for (i = 0; i < nr_cpus; i++) {
 		struct clock_thread *t = &cthreads[i];
 
+		if (!fio_cpu_isset(&mask, i))
+			continue;
 		t->cpu = i;
 		t->debug = debug;
 		t->seq = &seq;
@@ -704,6 +715,8 @@ int fio_monotonic_clocktest(int debug)
 	for (i = 0; i < nr_cpus; i++) {
 		struct clock_thread *t = &cthreads[i];
 
+		if (!fio_cpu_isset(&mask, i))
+			continue;
 		fio_sem_up(&t->lock);
 	}
 
@@ -711,6 +724,8 @@ int fio_monotonic_clocktest(int debug)
 		struct clock_thread *t = &cthreads[i];
 		void *ret;
 
+		if (!fio_cpu_isset(&mask, i))
+			continue;
 		pthread_join(t->thread, &ret);
 		if (ret)
 			failed++;
@@ -724,6 +739,7 @@ int fio_monotonic_clocktest(int debug)
 		goto err;
 	}
 
+	tentries = nr_entries * seen_cpus;
 	qsort(entries, tentries, sizeof(struct clock_entry), clock_cmp);
 
 	/* silence silly gcc */
