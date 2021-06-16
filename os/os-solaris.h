@@ -7,17 +7,21 @@
 #include <malloc.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include <sys/fcntl.h>
+#include <fcntl.h>
 #include <sys/pset.h>
 #include <sys/mman.h>
 #include <sys/dkio.h>
 #include <sys/byteorder.h>
+#include <sys/statvfs.h>
+#include <pthread.h>
 
 #include "../file.h"
+#include "../lib/types.h"
 
 #define FIO_HAVE_CPU_AFFINITY
 #define FIO_HAVE_CHARDEV_SIZE
 #define FIO_USE_GENERIC_BDEV_SIZE
+#define FIO_HAVE_FS_STAT
 #define FIO_USE_GENERIC_INIT_RANDOM_STATE
 #define FIO_HAVE_GETTID
 
@@ -43,7 +47,6 @@ struct solaris_rand_seed {
 #define FIO_OS_HAS_CTIME_R
 
 typedef psetid_t os_cpu_mask_t;
-typedef struct solaris_rand_seed os_random_state_t;
 
 static inline int chardev_size(struct fio_file *f, unsigned long long *bytes)
 {
@@ -65,22 +68,27 @@ static inline int blockdev_invalidate_cache(struct fio_file *f)
 
 static inline unsigned long long os_phys_mem(void)
 {
-	return 0;
+	long pagesize, pages;
+
+	pagesize = sysconf(_SC_PAGESIZE);
+	pages = sysconf(_SC_PHYS_PAGES);
+	if (pages == -1 || pagesize == -1)
+		return 0;
+
+	return (unsigned long long) pages * (unsigned long long) pagesize;
 }
 
-static inline void os_random_seed(unsigned long seed, os_random_state_t *rs)
+static inline unsigned long long get_fs_free_size(const char *path)
 {
-	rs->r[0] = seed & 0xffff;
-	seed >>= 16;
-	rs->r[1] = seed & 0xffff;
-	seed >>= 16;
-	rs->r[2] = seed & 0xffff;
-	seed48(rs->r);
-}
+	unsigned long long ret;
+	struct statvfs s;
 
-static inline long os_random_long(os_random_state_t *rs)
-{
-	return nrand48(rs->r);
+	if (statvfs(path, &s) < 0)
+		return -1ULL;
+
+	ret = s.f_frsize;
+	ret *= (unsigned long long) s.f_bfree;
+	return ret;
 }
 
 #define FIO_OS_DIRECTIO
@@ -103,24 +111,25 @@ static inline int fio_set_odirect(struct fio_file *f)
 #define fio_cpu_clear(mask, cpu)	pset_assign(PS_NONE, (cpu), NULL)
 #define fio_cpu_set(mask, cpu)		pset_assign(*(mask), (cpu), NULL)
 
-static inline int fio_cpu_isset(os_cpu_mask_t *mask, int cpu)
+static inline bool fio_cpu_isset(os_cpu_mask_t *mask, int cpu)
 {
 	const unsigned int max_cpus = sysconf(_SC_NPROCESSORS_ONLN);
 	unsigned int num_cpus;
 	processorid_t *cpus;
-	int i, ret;
+	bool ret;
+	int i;
 
 	cpus = malloc(sizeof(*cpus) * max_cpus);
 
 	if (pset_info(*mask, NULL, &num_cpus, cpus) < 0) {
 		free(cpus);
-		return 0;
+		return false;
 	}
 
-	ret = 0;
+	ret = false;
 	for (i = 0; i < num_cpus; i++) {
 		if (cpus[i] == cpu) {
-			ret = 1;
+			ret = true;
 			break;
 		}
 	}
@@ -155,10 +164,12 @@ static inline int fio_cpuset_exit(os_cpu_mask_t *mask)
 	return 0;
 }
 
+#ifndef CONFIG_HAVE_GETTID
 static inline int gettid(void)
 {
 	return pthread_self();
 }
+#endif
 
 /*
  * Should be enough, not aware of what (if any) restrictions Solaris has

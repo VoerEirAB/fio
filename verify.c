@@ -30,9 +30,6 @@
 static void populate_hdr(struct thread_data *td, struct io_u *io_u,
 			 struct verify_header *hdr, unsigned int header_num,
 			 unsigned int header_len);
-static void fill_hdr(struct thread_data *td, struct io_u *io_u,
-		     struct verify_header *hdr, unsigned int header_num,
-		     unsigned int header_len, uint64_t rand_seed);
 static void __fill_hdr(struct thread_data *td, struct io_u *io_u,
 		       struct verify_header *hdr, unsigned int header_num,
 		       unsigned int header_len, uint64_t rand_seed);
@@ -42,14 +39,14 @@ void fill_buffer_pattern(struct thread_data *td, void *p, unsigned int len)
 	(void)cpy_pattern(td->o.buffer_pattern, td->o.buffer_pattern_bytes, p, len);
 }
 
-static void __fill_buffer(struct thread_options *o, unsigned long seed, void *p,
+static void __fill_buffer(struct thread_options *o, uint64_t seed, void *p,
 			  unsigned int len)
 {
 	__fill_random_buf_percentage(seed, p, o->compress_percentage, len, len, o->buffer_pattern, o->buffer_pattern_bytes);
 }
 
-static unsigned long fill_buffer(struct thread_data *td, void *p,
-				 unsigned int len)
+static uint64_t fill_buffer(struct thread_data *td, void *p,
+			    unsigned int len)
 {
 	struct frand_state *fs = &td->verify_state;
 	struct thread_options *o = &td->o;
@@ -58,7 +55,7 @@ static unsigned long fill_buffer(struct thread_data *td, void *p,
 }
 
 void fill_verify_pattern(struct thread_data *td, void *p, unsigned int len,
-			 struct io_u *io_u, unsigned long seed, int use_seed)
+			 struct io_u *io_u, uint64_t seed, int use_seed)
 {
 	struct thread_options *o = &td->o;
 
@@ -90,15 +87,20 @@ static unsigned int get_hdr_inc(struct thread_data *td, struct io_u *io_u)
 {
 	unsigned int hdr_inc;
 
+	/*
+	 * If we use bs_unaligned, buflen can be larger than the verify
+	 * interval (which just defaults to the smallest blocksize possible).
+	 */
 	hdr_inc = io_u->buflen;
-	if (td->o.verify_interval && td->o.verify_interval <= io_u->buflen)
+	if (td->o.verify_interval && td->o.verify_interval <= io_u->buflen &&
+	    !td->o.bs_unaligned)
 		hdr_inc = td->o.verify_interval;
 
 	return hdr_inc;
 }
 
 static void fill_pattern_headers(struct thread_data *td, struct io_u *io_u,
-				 unsigned long seed, int use_seed)
+				 uint64_t seed, int use_seed)
 {
 	unsigned int hdr_inc, header_num;
 	struct verify_header *hdr;
@@ -239,40 +241,27 @@ struct vcont {
 };
 
 #define DUMP_BUF_SZ	255
-static int dump_buf_warned;
 
 static void dump_buf(char *buf, unsigned int len, unsigned long long offset,
 		     const char *type, struct fio_file *f)
 {
-	char *ptr, fname[DUMP_BUF_SZ];
-	size_t buf_left = DUMP_BUF_SZ;
+	char *ptr, *fname;
+	char sep[2] = { FIO_OS_PATH_SEPARATOR, 0 };
 	int ret, fd;
 
 	ptr = strdup(f->file_name);
 
-	memset(fname, 0, sizeof(fname));
-	if (aux_path)
-		sprintf(fname, "%s%s", aux_path, FIO_OS_PATH_SEPARATOR);
-
-	strncpy(fname + strlen(fname), basename(ptr), buf_left - 1);
-
-	buf_left -= strlen(fname);
-	if (buf_left <= 0) {
-		if (!dump_buf_warned) {
-			log_err("fio: verify failure dump buffer too small\n");
-			dump_buf_warned = 1;
-		}
-		free(ptr);
-		return;
+	if (asprintf(&fname, "%s%s%s.%llu.%s", aux_path ? : "",
+		     aux_path ? sep : "", basename(ptr), offset, type) < 0) {
+		if (!fio_did_warn(FIO_WARN_VERIFY_BUF))
+			log_err("fio: not enough memory for dump buffer filename\n");
+		goto free_ptr;
 	}
-
-	snprintf(fname + strlen(fname), buf_left, ".%llu.%s", offset, type);
 
 	fd = open(fname, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 	if (fd < 0) {
 		perror("open verify buf file");
-		free(ptr);
-		return;
+		goto free_fname;
 	}
 
 	while (len) {
@@ -289,6 +278,11 @@ static void dump_buf(char *buf, unsigned int len, unsigned long long offset,
 
 	close(fd);
 	log_err("       %s data dumped as %s\n", type, fname);
+
+free_fname:
+	free(fname);
+
+free_ptr:
 	free(ptr);
 }
 
@@ -351,8 +345,10 @@ static void log_verify_failure(struct verify_header *hdr, struct vcont *vc)
 
 	offset = vc->io_u->offset;
 	offset += vc->hdr_num * hdr->len;
-	log_err("%.8s: verify failed at file %s offset %llu, length %u\n",
-			vc->name, vc->io_u->file->file_name, offset, hdr->len);
+	log_err("%.8s: verify failed at file %s offset %llu, length %u"
+			" (requested block: offset=%llu, length=%llu)\n",
+			vc->name, vc->io_u->file->file_name, offset, hdr->len,
+			vc->io_u->offset, vc->io_u->buflen);
 
 	if (vc->good_crc && vc->bad_crc) {
 		log_err("       Expected CRC: ");
@@ -749,9 +745,9 @@ int verify_io_u_async(struct thread_data *td, struct io_u **io_u_ptr)
 	}
 	flist_add_tail(&io_u->verify_list, &td->verify_list);
 	*io_u_ptr = NULL;
-	pthread_mutex_unlock(&td->io_u_lock);
 
 	pthread_cond_signal(&td->verify_cond);
+	pthread_mutex_unlock(&td->io_u_lock);
 	return 0;
 }
 
@@ -807,7 +803,7 @@ static int verify_trimmed_io_u(struct thread_data *td, struct io_u *io_u)
 
 	mem_is_zero_slow(io_u->buf, io_u->buflen, &offset);
 
-	log_err("trim: verify failed at file %s offset %llu, length %lu"
+	log_err("trim: verify failed at file %s offset %llu, length %llu"
 		", block offset %lu\n",
 			io_u->file->file_name, io_u->offset, io_u->buflen,
 			(unsigned long) offset);
@@ -871,9 +867,11 @@ static int verify_header(struct io_u *io_u, struct thread_data *td,
 	return 0;
 
 err:
-	log_err(" at file %s offset %llu, length %u\n",
+	log_err(" at file %s offset %llu, length %u"
+		" (requested block: offset=%llu, length=%llu)\n",
 		io_u->file->file_name,
-		io_u->offset + hdr_num * hdr_len, hdr_len);
+		io_u->offset + hdr_num * hdr_len, hdr_len,
+		io_u->offset, io_u->buflen);
 
 	if (td->o.verify_dump)
 		dump_buf(p, hdr_len, io_u->offset + hdr_num * hdr_len,
@@ -925,10 +923,9 @@ int verify_io_u(struct thread_data *td, struct io_u **io_u_ptr)
 		hdr = p;
 
 		/*
-		 * Make rand_seed check pass when have verifysort or
-		 * verify_backlog.
+		 * Make rand_seed check pass when have verify_backlog.
 		 */
-		if (td->o.verifysort || (td->flags & TD_F_VER_BACKLOG))
+		if (!td_rw(td) || (td->flags & TD_F_VER_BACKLOG))
 			io_u->rand_seed = hdr->rand_seed;
 
 		if (td->o.verify != VERIFY_PATTERN_NO_HDR) {
@@ -1167,7 +1164,7 @@ static void __fill_hdr(struct thread_data *td, struct io_u *io_u,
 	hdr->rand_seed = rand_seed;
 	hdr->offset = io_u->offset + header_num * td->o.verify_interval;
 	hdr->time_sec = io_u->start_time.tv_sec;
-	hdr->time_usec = io_u->start_time.tv_nsec / 1000;
+	hdr->time_nsec = io_u->start_time.tv_nsec;
 	hdr->thread = td->thread_number;
 	hdr->numberio = io_u->numberio;
 	hdr->crc32 = fio_crc32c(p, offsetof(struct verify_header, crc32));
@@ -1178,7 +1175,6 @@ static void fill_hdr(struct thread_data *td, struct io_u *io_u,
 		     struct verify_header *hdr, unsigned int header_num,
 		     unsigned int header_len, uint64_t rand_seed)
 {
-
 	if (td->o.verify != VERIFY_PATTERN_NO_HDR)
 		__fill_hdr(td, io_u, hdr, header_num, header_len, rand_seed);
 }
@@ -1309,7 +1305,7 @@ int get_next_verify(struct thread_data *td, struct io_u *io_u)
 		return 0;
 
 	if (!RB_EMPTY_ROOT(&td->io_hist_tree)) {
-		struct rb_node *n = rb_first(&td->io_hist_tree);
+		struct fio_rb_node *n = rb_first(&td->io_hist_tree);
 
 		ipo = rb_entry(n, struct io_piece, rb_node);
 
@@ -1456,9 +1452,9 @@ static void *verify_async_thread(void *data)
 done:
 	pthread_mutex_lock(&td->io_u_lock);
 	td->nr_verify_threads--;
+	pthread_cond_signal(&td->free_cond);
 	pthread_mutex_unlock(&td->io_u_lock);
 
-	pthread_cond_signal(&td->free_cond);
 	return NULL;
 }
 
@@ -1494,9 +1490,12 @@ int verify_async_init(struct thread_data *td)
 
 	if (i != td->o.verify_async) {
 		log_err("fio: only %d verify threads started, exiting\n", i);
+
+		pthread_mutex_lock(&td->io_u_lock);
 		td->verify_thread_exit = 1;
-		write_barrier();
 		pthread_cond_broadcast(&td->verify_cond);
+		pthread_mutex_unlock(&td->io_u_lock);
+
 		return 1;
 	}
 
@@ -1505,11 +1504,9 @@ int verify_async_init(struct thread_data *td)
 
 void verify_async_exit(struct thread_data *td)
 {
-	td->verify_thread_exit = 1;
-	write_barrier();
-	pthread_cond_broadcast(&td->verify_cond);
-
 	pthread_mutex_lock(&td->io_u_lock);
+	td->verify_thread_exit = 1;
+	pthread_cond_broadcast(&td->verify_cond);
 
 	while (td->nr_verify_threads)
 		pthread_cond_wait(&td->free_cond, &td->io_u_lock);
@@ -1524,7 +1521,7 @@ int paste_blockoff(char *buf, unsigned int len, void *priv)
 	struct io_u *io = priv;
 	unsigned long long off;
 
-	typecheck(typeof(off), io->offset);
+	typecheck(__typeof__(off), io->offset);
 	off = cpu_to_le64((uint64_t)io->offset);
 	len = min(len, (unsigned int)sizeof(off));
 	memcpy(buf, &off, len);
@@ -1726,7 +1723,7 @@ void verify_save_state(int mask)
 		char prefix[PATH_MAX];
 
 		if (aux_path)
-			sprintf(prefix, "%s%slocal", aux_path, FIO_OS_PATH_SEPARATOR);
+			sprintf(prefix, "%s%clocal", aux_path, FIO_OS_PATH_SEPARATOR);
 		else
 			strcpy(prefix, "local");
 

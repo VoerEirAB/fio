@@ -3,7 +3,7 @@
  *
  * Should be compiled with:
  *
- * gcc -Wall -O2 -g -shared -rdynamic -fPIC -o skeleton_external.o skeleton_external.c
+ * gcc -Wall -O2 -g -D_GNU_SOURCE -include ../config-host.h -shared -rdynamic -fPIC -o skeleton_external.o skeleton_external.c
  * (also requires -D_GNU_SOURCE -DCONFIG_STRSEP on Linux)
  *
  */
@@ -90,7 +90,8 @@ static int fio_skeleton_cancel(struct thread_data *td, struct io_u *io_u)
  * io_u->xfer_buflen. Residual data count may be set in io_u->resid
  * for a short read/write.
  */
-static int fio_skeleton_queue(struct thread_data *td, struct io_u *io_u)
+static enum fio_q_status fio_skeleton_queue(struct thread_data *td,
+					    struct io_u *io_u)
 {
 	/*
 	 * Double sanity check to catch errant write on a readonly setup

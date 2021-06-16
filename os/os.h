@@ -8,7 +8,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 
-#include "../arch/arch.h"
+#include "../arch/arch.h" /* IWYU pragma: export */
 #include "../lib/types.h"
 
 enum {
@@ -27,6 +27,11 @@ enum {
 	os_nr,
 };
 
+typedef enum {
+        CPU_ARM64_CRC32C,
+} cpu_features;
+
+/* IWYU pragma: begin_exports */
 #if defined(__ANDROID__)
 #include "os-android.h"
 #elif defined(__linux__)
@@ -67,6 +72,7 @@ typedef struct aiocb os_aiocb_t;
 #ifndef CONFIG_STRLCAT
 #include "../oslib/strlcat.h"
 #endif
+/* IWYU pragma: end_exports */
 
 #ifdef MSG_DONTWAIT
 #define OS_MSG_DONTWAIT	MSG_DONTWAIT
@@ -155,7 +161,7 @@ extern int fio_cpus_split(os_cpu_mask_t *mask, unsigned int cpu);
 #endif
 
 #ifndef FIO_OS_PATH_SEPARATOR
-#define FIO_OS_PATH_SEPARATOR	"/"
+#define FIO_OS_PATH_SEPARATOR	'/'
 #endif
 
 #ifndef FIO_PREFERRED_CLOCK_SOURCE
@@ -204,19 +210,27 @@ static inline uint64_t fio_swap64(uint64_t val)
 
 #ifndef FIO_HAVE_BYTEORDER_FUNCS
 #ifdef CONFIG_LITTLE_ENDIAN
+#define __be16_to_cpu(x)		fio_swap16(x)
+#define __be32_to_cpu(x)		fio_swap32(x)
 #define __be64_to_cpu(x)		fio_swap64(x)
 #define __le16_to_cpu(x)		(x)
 #define __le32_to_cpu(x)		(x)
 #define __le64_to_cpu(x)		(x)
+#define __cpu_to_be16(x)		fio_swap16(x)
+#define __cpu_to_be32(x)		fio_swap32(x)
 #define __cpu_to_be64(x)		fio_swap64(x)
 #define __cpu_to_le16(x)		(x)
 #define __cpu_to_le32(x)		(x)
 #define __cpu_to_le64(x)		(x)
 #else
+#define __be16_to_cpu(x)		(x)
+#define __be32_to_cpu(x)		(x)
 #define __be64_to_cpu(x)		(x)
 #define __le16_to_cpu(x)		fio_swap16(x)
 #define __le32_to_cpu(x)		fio_swap32(x)
 #define __le64_to_cpu(x)		fio_swap64(x)
+#define __cpu_to_be16(x)		(x)
+#define __cpu_to_be32(x)		(x)
 #define __cpu_to_be64(x)		(x)
 #define __cpu_to_le16(x)		fio_swap16(x)
 #define __cpu_to_le32(x)		fio_swap32(x)
@@ -225,6 +239,14 @@ static inline uint64_t fio_swap64(uint64_t val)
 #endif /* FIO_HAVE_BYTEORDER_FUNCS */
 
 #ifdef FIO_INTERNAL
+#define be16_to_cpu(val) ({			\
+	typecheck(uint16_t, val);		\
+	__be16_to_cpu(val);			\
+})
+#define be32_to_cpu(val) ({			\
+	typecheck(uint32_t, val);		\
+	__be32_to_cpu(val);			\
+})
 #define be64_to_cpu(val) ({			\
 	typecheck(uint64_t, val);		\
 	__be64_to_cpu(val);			\
@@ -243,6 +265,14 @@ static inline uint64_t fio_swap64(uint64_t val)
 })
 #endif
 
+#define cpu_to_be16(val) ({			\
+	typecheck(uint16_t, val);		\
+	__cpu_to_be16(val);			\
+})
+#define cpu_to_be32(val) ({			\
+	typecheck(uint32_t, val);		\
+	__cpu_to_be32(val);			\
+})
 #define cpu_to_be64(val) ({			\
 	typecheck(uint64_t, val);		\
 	__cpu_to_be64(val);			\
@@ -292,25 +322,8 @@ static inline int blockdev_size(struct fio_file *f, unsigned long long *bytes)
 }
 #endif
 
-#ifdef FIO_USE_GENERIC_RAND
-typedef unsigned int os_random_state_t;
-
-static inline void os_random_seed(unsigned long seed, os_random_state_t *rs)
-{
-	srand(seed);
-}
-
-static inline long os_random_long(os_random_state_t *rs)
-{
-	long val;
-
-	val = rand_r(rs);
-	return val;
-}
-#endif
-
 #ifdef FIO_USE_GENERIC_INIT_RANDOM_STATE
-static inline int init_random_seeds(unsigned long *rand_seeds, int size)
+static inline int init_random_seeds(uint64_t *rand_seeds, int size)
 {
 	int fd;
 
@@ -360,10 +373,12 @@ static inline int CPU_COUNT(os_cpu_mask_t *mask)
 #endif
 
 #ifndef FIO_HAVE_GETTID
+#ifndef CONFIG_HAVE_GETTID
 static inline int gettid(void)
 {
 	return getpid();
 }
+#endif
 #endif
 
 #ifndef FIO_HAVE_SHM_ATTACH_REMOVED
@@ -383,6 +398,13 @@ static inline bool fio_fallocate(struct fio_file *f, uint64_t offset, uint64_t l
 
 #if defined(CONFIG_POSIX_FALLOCATE) || defined(FIO_HAVE_NATIVE_FALLOCATE)
 # define FIO_HAVE_ANY_FALLOCATE
+#endif
+
+#ifndef FIO_HAVE_CPU_HAS
+static inline bool os_cpu_has(cpu_features feature)
+{
+	return false;
+}
 #endif
 
 #endif

@@ -16,7 +16,6 @@
 
 #include "../file.h"
 
-#define FIO_USE_GENERIC_RAND
 #define FIO_USE_GENERIC_INIT_RANDOM_STATE
 #define FIO_HAVE_GETTID
 #define FIO_HAVE_CHARDEV_SIZE
@@ -91,10 +90,12 @@ static inline unsigned long long os_phys_mem(void)
 	return mem;
 }
 
+#ifndef CONFIG_HAVE_GETTID
 static inline int gettid(void)
 {
 	return mach_thread_self();
 }
+#endif
 
 /*
  * For some reason, there's no header definition for fdatasync(), even
