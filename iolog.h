@@ -1,6 +1,8 @@
 #ifndef FIO_IOLOG_H
 #define FIO_IOLOG_H
 
+#include <stdio.h>
+
 #include "lib/rbtree.h"
 #include "lib/ieee754.h"
 #include "flist.h"
@@ -40,7 +42,7 @@ struct io_sample {
 	uint64_t time;
 	union io_sample_data data;
 	uint32_t __ddir;
-	uint32_t bs;
+	uint64_t bs;
 };
 
 struct io_sample_offset {
@@ -199,7 +201,7 @@ enum {
  */
 struct io_piece {
 	union {
-		struct rb_node rb_node;
+		struct fio_rb_node rb_node;
 		struct flist_head list;
 	};
 	struct flist_head trim_list;
@@ -232,16 +234,17 @@ struct io_u;
 extern int __must_check read_iolog_get(struct thread_data *, struct io_u *);
 extern void log_io_u(const struct thread_data *, const struct io_u *);
 extern void log_file(struct thread_data *, struct fio_file *, enum file_log_act);
-extern int __must_check init_iolog(struct thread_data *td);
+extern bool __must_check init_iolog(struct thread_data *td);
 extern void log_io_piece(struct thread_data *, struct io_u *);
 extern void unlog_io_piece(struct thread_data *, struct io_u *);
-extern void trim_io_piece(struct thread_data *, const struct io_u *);
+extern void trim_io_piece(const struct io_u *);
 extern void queue_io_piece(struct thread_data *, struct io_piece *);
 extern void prune_io_piece_log(struct thread_data *);
 extern void write_iolog_close(struct thread_data *);
 extern int iolog_compress_init(struct thread_data *, struct sk_out *);
 extern void iolog_compress_exit(struct thread_data *);
 extern size_t log_chunk_sizes(struct io_log *);
+extern int init_io_u_buffers(struct thread_data *);
 
 #ifdef CONFIG_ZLIB
 extern int iolog_file_inflate(const char *);
@@ -286,7 +289,7 @@ extern void finalize_logs(struct thread_data *td, bool);
 extern void setup_log(struct io_log **, struct log_params *, const char *);
 extern void flush_log(struct io_log *, bool);
 extern void flush_samples(FILE *, void *, uint64_t);
-extern unsigned long hist_sum(int, int, unsigned int *, unsigned int *);
+extern uint64_t hist_sum(int, int, uint64_t *, uint64_t *);
 extern void free_log(struct io_log *);
 extern void fio_writeout_logs(bool);
 extern void td_writeout_logs(struct thread_data *, bool);
@@ -294,7 +297,7 @@ extern int iolog_cur_flush(struct io_log *, struct io_logs *);
 
 static inline void init_ipo(struct io_piece *ipo)
 {
-	memset(ipo, 0, sizeof(*ipo));
+	INIT_FLIST_HEAD(&ipo->list);
 	INIT_FLIST_HEAD(&ipo->trim_list);
 }
 

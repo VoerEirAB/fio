@@ -3,6 +3,16 @@
 
 #include <string.h>
 
+#ifndef __NR_sys_io_uring_setup
+#define __NR_sys_io_uring_setup		425
+#endif
+#ifndef __NR_sys_io_uring_enter
+#define __NR_sys_io_uring_enter		426
+#endif
+#ifndef __NR_sys_io_uring_register
+#define __NR_sys_io_uring_register	427
+#endif
+
 static inline void cpuid(unsigned int op,
 			 unsigned int *eax, unsigned int *ebx,
 			 unsigned int *ecx, unsigned int *edx)
@@ -13,11 +23,12 @@ static inline void cpuid(unsigned int op,
 }
 
 #define ARCH_HAVE_INIT
+#define ARCH_HAVE_IOURING
 
 extern bool tsc_reliable;
 extern int arch_random;
 
-static inline void arch_init_intel(unsigned int level)
+static inline void arch_init_intel(void)
 {
 	unsigned int eax, ebx, ecx = 0, edx;
 
@@ -44,7 +55,7 @@ static inline void arch_init_intel(unsigned int level)
 	arch_random = (ecx & (1U << 30)) != 0;
 }
 
-static inline void arch_init_amd(unsigned int level)
+static inline void arch_init_amd(void)
 {
 	unsigned int eax, ebx, ecx, edx;
 
@@ -69,9 +80,9 @@ static inline void arch_init(char *envp[])
 
 	str[12] = '\0';
 	if (!strcmp(str, "GenuineIntel"))
-		arch_init_intel(level);
-	else if (!strcmp(str, "AuthenticAMD"))
-		arch_init_amd(level);
+		arch_init_intel();
+	else if (!strcmp(str, "AuthenticAMD") || !strcmp(str, "HygonGenuine"))
+		arch_init_amd();
 }
 
 #endif

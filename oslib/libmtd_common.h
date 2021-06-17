@@ -13,7 +13,7 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
 /* Imported from mtd-utils by dehrenberg */
@@ -49,18 +49,18 @@ extern "C" {
 #define min(a, b) MIN(a, b) /* glue for linux kernel source */
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
-#define ALIGN(x,a) __ALIGN_MASK(x,(typeof(x))(a)-1)
+#define ALIGN(x,a) __ALIGN_MASK(x,(__typeof__(x))(a)-1)
 #define __ALIGN_MASK(x,mask) (((x)+(mask))&~(mask))
 
 #define min_t(t,x,y) ({ \
-	typeof((x)) _x = (x); \
-	typeof((y)) _y = (y); \
+	__typeof__((x)) _x = (x); \
+	__typeof__((y)) _y = (y); \
 	(_x < _y) ? _x : _y; \
 })
 
 #define max_t(t,x,y) ({ \
-	typeof((x)) _x = (x); \
-	typeof((y)) _y = (y); \
+	__typeof__((x)) _x = (x); \
+	__typeof__((y)) _y = (y); \
 	(_x > _y) ? _x : _y; \
 })
 

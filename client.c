@@ -1,13 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <sys/poll.h>
+#include <poll.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
@@ -23,17 +21,18 @@
 #include "server.h"
 #include "flist.h"
 #include "hash.h"
-#include "verify.h"
+#include "verify-state.h"
 
 static void handle_du(struct fio_client *client, struct fio_net_cmd *cmd);
 static void handle_ts(struct fio_client *client, struct fio_net_cmd *cmd);
 static void handle_gs(struct fio_client *client, struct fio_net_cmd *cmd);
 static void handle_probe(struct fio_client *client, struct fio_net_cmd *cmd);
 static void handle_text(struct fio_client *client, struct fio_net_cmd *cmd);
-static void handle_stop(struct fio_client *client, struct fio_net_cmd *cmd);
+static void handle_stop(struct fio_client *client);
 static void handle_start(struct fio_client *client, struct fio_net_cmd *cmd);
 
 static void convert_text(struct fio_net_cmd *cmd);
+static void client_display_thread_status(struct jobs_eta *je);
 
 struct client_ops fio_client_ops = {
 	.text		= handle_text,
@@ -42,7 +41,7 @@ struct client_ops fio_client_ops = {
 	.group_stats	= handle_gs,
 	.stop		= handle_stop,
 	.start		= handle_start,
-	.eta		= display_thread_status,
+	.eta		= client_display_thread_status,
 	.probe		= handle_probe,
 	.eta_msec	= FIO_CLIENT_DEF_ETA_MSEC,
 	.client_type	= FIO_CLIENT_TYPE_CLI,
@@ -60,6 +59,7 @@ struct group_run_stats client_gs;
 int sum_stat_clients;
 
 static int sum_stat_nr;
+static struct buf_output allclients;
 static struct json_object *root = NULL;
 static struct json_object *job_opt_object = NULL;
 static struct json_array *clients_array = NULL;
@@ -120,6 +120,58 @@ static int read_data(int fd, void *data, size_t size)
 	return 0;
 }
 
+static int read_ini_data(int fd, void *data, size_t size)
+{
+	char *p = data;
+	int ret = 0;
+	FILE *fp;
+	int dupfd;
+
+	dupfd = dup(fd);
+	if (dupfd < 0)
+		return errno;
+
+	fp = fdopen(dupfd, "r");
+	if (!fp) {
+		ret = errno;
+		close(dupfd);
+		goto out;
+	}
+
+	while (1) {
+		ssize_t len;
+		char buf[OPT_LEN_MAX+1], *sub;
+
+		if (!fgets(buf, sizeof(buf), fp)) {
+			if (ferror(fp)) {
+				if (errno == EAGAIN || errno == EINTR)
+					continue;
+				ret = errno;
+			}
+			break;
+		}
+
+		sub = fio_option_dup_subs(buf);
+		len = strlen(sub);
+		if (len + 1 > size) {
+			log_err("fio: no space left to read data\n");
+			free(sub);
+			ret = ENOSPC;
+			break;
+		}
+
+		memcpy(p, sub, len);
+		free(sub);
+		p += len;
+		*p = '\0';
+		size -= len;
+	}
+
+	fclose(fp);
+out:
+	return ret;
+}
+
 static void fio_client_json_init(void)
 {
 	char time_buf[32];
@@ -147,14 +199,23 @@ static void fio_client_json_init(void)
 
 static void fio_client_json_fini(void)
 {
-	if (!(output_format & FIO_OUTPUT_JSON))
+	struct buf_output out;
+
+	if (!root)
 		return;
 
-	log_info("\n");
-	json_print_object(root, NULL);
-	log_info("\n");
+	buf_output_init(&out);
+
+	__log_buf(&out, "\n");
+	json_print_object(root, &out);
+	__log_buf(&out, "\n");
+	log_info_buf(out.buf, out.buflen);
+
+	buf_output_free(&out);
+
 	json_free_object(root);
 	root = NULL;
+	job_opt_object = NULL;
 	clients_array = NULL;
 	du_array = NULL;
 }
@@ -181,6 +242,9 @@ void fio_put_client(struct fio_client *client)
 {
 	if (--client->refs)
 		return;
+
+	log_info_buf(client->buf.buf, client->buf.buflen);
+	buf_output_free(&client->buf);
 
 	free(client->hostname);
 	if (client->argv)
@@ -300,9 +364,7 @@ void fio_client_add_cmd_option(void *cookie, const char *opt)
 	}
 }
 
-struct fio_client *fio_client_add_explicit(struct client_ops *ops,
-					   const char *hostname, int type,
-					   int port)
+static struct fio_client *get_new_client(void)
 {
 	struct fio_client *client;
 
@@ -314,6 +376,19 @@ struct fio_client *fio_client_add_explicit(struct client_ops *ops,
 	INIT_FLIST_HEAD(&client->arg_list);
 	INIT_FLIST_HEAD(&client->eta_list);
 	INIT_FLIST_HEAD(&client->cmd_list);
+
+	buf_output_init(&client->buf);
+
+	return client;
+}
+
+struct fio_client *fio_client_add_explicit(struct client_ops *ops,
+					   const char *hostname, int type,
+					   int port)
+{
+	struct fio_client *client;
+
+	client = get_new_client();
 
 	client->hostname = strdup(hostname);
 
@@ -390,14 +465,7 @@ int fio_client_add(struct client_ops *ops, const char *hostname, void **cookie)
 		}
 	}
 
-	client = malloc(sizeof(*client));
-	memset(client, 0, sizeof(*client));
-
-	INIT_FLIST_HEAD(&client->list);
-	INIT_FLIST_HEAD(&client->hash_list);
-	INIT_FLIST_HEAD(&client->arg_list);
-	INIT_FLIST_HEAD(&client->eta_list);
-	INIT_FLIST_HEAD(&client->cmd_list);
+	client = get_new_client();
 
 	if (fio_server_parse_string(hostname, &client->hostname,
 					&client->is_sock, &client->port,
@@ -765,13 +833,17 @@ static int __fio_client_send_local_ini(struct fio_client *client,
 		return ret;
 	}
 
+	/*
+	 * Add extra space for variable expansion, but doesn't guarantee.
+	 */
+	sb.st_size += OPT_LEN_MAX;
 	p_size = sb.st_size + sizeof(*pdu);
 	pdu = malloc(p_size);
 	buf = pdu->buf;
 
 	len = sb.st_size;
 	p = buf;
-	if (read_data(fd, p, len)) {
+	if (read_ini_data(fd, p, len)) {
 		log_err("fio: failed reading job file %s\n", filename);
 		close(fd);
 		free(pdu);
@@ -905,21 +977,21 @@ static void convert_ts(struct thread_stat *dst, struct thread_stat *src)
 	}
 
 	for (i = 0; i < FIO_IO_U_MAP_NR; i++) {
-		dst->io_u_map[i]	= le32_to_cpu(src->io_u_map[i]);
-		dst->io_u_submit[i]	= le32_to_cpu(src->io_u_submit[i]);
-		dst->io_u_complete[i]	= le32_to_cpu(src->io_u_complete[i]);
+		dst->io_u_map[i]	= le64_to_cpu(src->io_u_map[i]);
+		dst->io_u_submit[i]	= le64_to_cpu(src->io_u_submit[i]);
+		dst->io_u_complete[i]	= le64_to_cpu(src->io_u_complete[i]);
 	}
 
 	for (i = 0; i < FIO_IO_U_LAT_N_NR; i++)
-		dst->io_u_lat_n[i]	= le32_to_cpu(src->io_u_lat_n[i]);
+		dst->io_u_lat_n[i]	= le64_to_cpu(src->io_u_lat_n[i]);
 	for (i = 0; i < FIO_IO_U_LAT_U_NR; i++)
-		dst->io_u_lat_u[i]	= le32_to_cpu(src->io_u_lat_u[i]);
+		dst->io_u_lat_u[i]	= le64_to_cpu(src->io_u_lat_u[i]);
 	for (i = 0; i < FIO_IO_U_LAT_M_NR; i++)
-		dst->io_u_lat_m[i]	= le32_to_cpu(src->io_u_lat_m[i]);
+		dst->io_u_lat_m[i]	= le64_to_cpu(src->io_u_lat_m[i]);
 
 	for (i = 0; i < DDIR_RWDIR_CNT; i++)
 		for (j = 0; j < FIO_IO_U_PLAT_NR; j++)
-			dst->io_u_plat[i][j] = le32_to_cpu(src->io_u_plat[i][j]);
+			dst->io_u_plat[i][j] = le64_to_cpu(src->io_u_plat[i][j]);
 
 	for (i = 0; i < DDIR_RWDIR_CNT; i++) {
 		dst->total_io_u[i]	= le64_to_cpu(src->total_io_u[i]);
@@ -929,6 +1001,7 @@ static void convert_ts(struct thread_stat *dst, struct thread_stat *src)
 
 	dst->total_submit	= le64_to_cpu(src->total_submit);
 	dst->total_complete	= le64_to_cpu(src->total_complete);
+	dst->nr_zone_resets	= le64_to_cpu(src->nr_zone_resets);
 
 	for (i = 0; i < DDIR_RWDIR_CNT; i++) {
 		dst->io_bytes[i]	= le64_to_cpu(src->io_bytes[i]);
@@ -941,6 +1014,8 @@ static void convert_ts(struct thread_stat *dst, struct thread_stat *src)
 	dst->first_error	= le32_to_cpu(src->first_error);
 	dst->kb_base		= le32_to_cpu(src->kb_base);
 	dst->unit_base		= le32_to_cpu(src->unit_base);
+
+	dst->sig_figs		= le32_to_cpu(src->sig_figs);
 
 	dst->latency_depth	= le32_to_cpu(src->latency_depth);
 	dst->latency_target	= le64_to_cpu(src->latency_target);
@@ -959,12 +1034,15 @@ static void convert_ts(struct thread_stat *dst, struct thread_stat *src)
 	dst->ss_deviation.u.f 	= fio_uint64_to_double(le64_to_cpu(src->ss_deviation.u.i));
 	dst->ss_criterion.u.f 	= fio_uint64_to_double(le64_to_cpu(src->ss_criterion.u.i));
 
-	if (dst->ss_state & __FIO_SS_DATA) {
+	if (dst->ss_state & FIO_SS_DATA) {
 		for (i = 0; i < dst->ss_dur; i++ ) {
 			dst->ss_iops_data[i] = le64_to_cpu(src->ss_iops_data[i]);
 			dst->ss_bw_data[i] = le64_to_cpu(src->ss_bw_data[i]);
 		}
 	}
+
+	dst->cachehit		= le64_to_cpu(src->cachehit);
+	dst->cachemiss		= le64_to_cpu(src->cachemiss);
 }
 
 static void convert_gs(struct group_run_stats *dst, struct group_run_stats *src)
@@ -982,6 +1060,7 @@ static void convert_gs(struct group_run_stats *dst, struct group_run_stats *src)
 
 	dst->kb_base	= le32_to_cpu(src->kb_base);
 	dst->unit_base	= le32_to_cpu(src->unit_base);
+	dst->sig_figs	= le32_to_cpu(src->sig_figs);
 	dst->groupid	= le32_to_cpu(src->groupid);
 	dst->unified_rw_rep	= le32_to_cpu(src->unified_rw_rep);
 }
@@ -1004,7 +1083,7 @@ static void handle_ts(struct fio_client *client, struct fio_net_cmd *cmd)
 	if (client->opt_lists && p->ts.thread_number <= client->jobs)
 		opt_list = &client->opt_lists[p->ts.thread_number - 1];
 
-	tsobj = show_thread_status(&p->ts, &p->rs, opt_list, NULL);
+	tsobj = show_thread_status(&p->ts, &p->rs, opt_list, &client->buf);
 	client->did_stat = true;
 	if (tsobj) {
 		json_object_add_client_info(tsobj, client);
@@ -1021,10 +1100,11 @@ static void handle_ts(struct fio_client *client, struct fio_net_cmd *cmd)
 	client_ts.thread_number = p->ts.thread_number;
 	client_ts.groupid = p->ts.groupid;
 	client_ts.unified_rw_rep = p->ts.unified_rw_rep;
+	client_ts.sig_figs = p->ts.sig_figs;
 
 	if (++sum_stat_nr == sum_stat_clients) {
 		strcpy(client_ts.name, "All clients");
-		tsobj = show_thread_status(&client_ts, &client_gs, NULL, NULL);
+		tsobj = show_thread_status(&client_ts, &client_gs, NULL, &allclients);
 		if (tsobj) {
 			json_object_add_client_info(tsobj, client);
 			json_array_add_value_object(clients_array, tsobj);
@@ -1037,7 +1117,7 @@ static void handle_gs(struct fio_client *client, struct fio_net_cmd *cmd)
 	struct group_run_stats *gs = (struct group_run_stats *) cmd->payload;
 
 	if (output_format & FIO_OUTPUT_NORMAL)
-		show_group_stats(gs, NULL);
+		show_group_stats(gs, &client->buf);
 }
 
 static void handle_job_opt(struct fio_client *client, struct fio_net_cmd *cmd)
@@ -1079,13 +1159,17 @@ static void handle_text(struct fio_client *client, struct fio_net_cmd *cmd)
 	const char *buf = (const char *) pdu->buf;
 	const char *name;
 	int fio_unused ret;
+	struct buf_output out;
+
+	buf_output_init(&out);
 
 	name = client->name ? client->name : client->hostname;
 
-	if (!client->skip_newline)
-		fprintf(f_out, "<%s> ", name);
-	ret = fwrite(buf, pdu->buf_len, 1, f_out);
-	fflush(f_out);
+	if (!client->skip_newline && !(output_format & FIO_OUTPUT_TERSE))
+		__log_buf(&out, "<%s> ", name);
+	__log_buf(&out, "%s", buf);
+	log_info_buf(out.buf, out.buflen);
+	buf_output_free(&out);
 	client->skip_newline = strchr(buf, '\n') == NULL;
 }
 
@@ -1126,21 +1210,24 @@ static void handle_du(struct fio_client *client, struct fio_net_cmd *cmd)
 {
 	struct cmd_du_pdu *du = (struct cmd_du_pdu *) cmd->payload;
 
-	if (!client->disk_stats_shown) {
+	if (!client->disk_stats_shown)
 		client->disk_stats_shown = true;
-		log_info("\nDisk stats (read/write):\n");
-	}
 
 	if (output_format & FIO_OUTPUT_JSON) {
 		struct json_object *duobj;
+
 		json_array_add_disk_util(&du->dus, &du->agg, du_array);
 		duobj = json_array_last_value_object(du_array);
 		json_object_add_client_info(duobj, client);
 	}
-	if (output_format & FIO_OUTPUT_TERSE)
-		print_disk_util(&du->dus, &du->agg, 1, NULL);
-	if (output_format & FIO_OUTPUT_NORMAL)
-		print_disk_util(&du->dus, &du->agg, 0, NULL);
+	if (output_format & FIO_OUTPUT_NORMAL) {
+		__log_buf(&client->buf, "\nDisk stats (read/write):\n");
+		print_disk_util(&du->dus, &du->agg, 0, &client->buf);
+	}
+	if (output_format & FIO_OUTPUT_TERSE && terse_version >= 3) {
+		print_disk_util(&du->dus, &du->agg, 1, &client->buf);
+		__log_buf(&client->buf, "\n");
+	}
 }
 
 static void convert_jobs_eta(struct jobs_eta *je)
@@ -1167,6 +1254,7 @@ static void convert_jobs_eta(struct jobs_eta *je)
 	je->nr_threads		= le32_to_cpu(je->nr_threads);
 	je->is_pow2		= le32_to_cpu(je->is_pow2);
 	je->unit_base		= le32_to_cpu(je->unit_base);
+	je->sig_figs		= le32_to_cpu(je->sig_figs);
 }
 
 void fio_client_sum_jobs_eta(struct jobs_eta *dst, struct jobs_eta *je)
@@ -1278,7 +1366,7 @@ static void client_flush_hist_samples(FILE *f, int hist_coarseness, void *sample
 	int log_offset;
 	uint64_t i, j, nr_samples;
 	struct io_u_plat_entry *entry;
-	unsigned int *io_u_plat;
+	uint64_t *io_u_plat;
 
 	int stride = 1 << hist_coarseness;
 
@@ -1298,12 +1386,12 @@ static void client_flush_hist_samples(FILE *f, int hist_coarseness, void *sample
 		entry = s->data.plat_entry;
 		io_u_plat = entry->io_u_plat;
 
-		fprintf(f, "%lu, %u, %u, ", (unsigned long) s->time,
-						io_sample_ddir(s), s->bs);
+		fprintf(f, "%lu, %u, %llu, ", (unsigned long) s->time,
+						io_sample_ddir(s), (unsigned long long) s->bs);
 		for (j = 0; j < FIO_IO_U_PLAT_NR - stride; j += stride) {
-			fprintf(f, "%lu, ", hist_sum(j, stride, io_u_plat, NULL));
+			fprintf(f, "%llu, ", (unsigned long long)hist_sum(j, stride, io_u_plat, NULL));
 		}
-		fprintf(f, "%lu\n", (unsigned long)
+		fprintf(f, "%llu\n", (unsigned long long)
 			hist_sum(FIO_IO_U_PLAT_NR - stride, stride, io_u_plat, NULL));
 
 	}
@@ -1312,14 +1400,16 @@ static void client_flush_hist_samples(FILE *f, int hist_coarseness, void *sample
 static int fio_client_handle_iolog(struct fio_client *client,
 				   struct fio_net_cmd *cmd)
 {
-	struct cmd_iolog_pdu *pdu;
+	struct cmd_iolog_pdu *pdu = NULL;
 	bool store_direct;
-	char *log_pathname;
+	char *log_pathname = NULL;
+	int ret = 0;
 
 	pdu = convert_iolog(cmd, &store_direct);
 	if (!pdu) {
 		log_err("fio: failed converting IO log\n");
-		return 1;
+		ret = 1;
+		goto out;
 	}
 
         /* allocate buffer big enough for next sprintf() call */
@@ -1327,13 +1417,14 @@ static int fio_client_handle_iolog(struct fio_client *client,
 			strlen(client->hostname));
 	if (!log_pathname) {
 		log_err("fio: memory allocation of unique pathname failed\n");
-		return -1;
+		ret = -1;
+		goto out;
 	}
 	/* generate a unique pathname for the log file using hostname */
 	sprintf(log_pathname, "%s.%s", pdu->name, client->hostname);
 
 	if (store_direct) {
-		ssize_t ret;
+		ssize_t wrote;
 		size_t sz;
 		int fd;
 
@@ -1342,26 +1433,29 @@ static int fio_client_handle_iolog(struct fio_client *client,
 		if (fd < 0) {
 			log_err("fio: open log %s: %s\n",
 				log_pathname, strerror(errno));
-			return 1;
+			ret = 1;
+			goto out;
 		}
 
 		sz = cmd->pdu_len - sizeof(*pdu);
-		ret = write(fd, pdu->samples, sz);
+		wrote = write(fd, pdu->samples, sz);
 		close(fd);
 
-		if (ret != sz) {
+		if (wrote != sz) {
 			log_err("fio: short write on compressed log\n");
-			return 1;
+			ret = 1;
+			goto out;
 		}
 
-		return 0;
+		ret = 0;
 	} else {
 		FILE *f;
 		f = fopen((const char *) log_pathname, "w");
 		if (!f) {
 			log_err("fio: fopen log %s : %s\n",
 				log_pathname, strerror(errno));
-			return 1;
+			ret = 1;
+			goto out;
 		}
 
 		if (pdu->log_type == IO_LOG_TYPE_HIST) {
@@ -1372,8 +1466,17 @@ static int fio_client_handle_iolog(struct fio_client *client,
 					pdu->nr_samples * sizeof(struct io_sample));
 		}
 		fclose(f);
-		return 0;
+		ret = 0;
 	}
+
+out:
+	if (pdu && pdu != (void *) cmd->payload)
+		free(pdu);
+
+	if (log_pathname)
+		free(log_pathname);
+
+	return ret;
 }
 
 static void handle_probe(struct fio_client *client, struct fio_net_cmd *cmd)
@@ -1393,9 +1496,11 @@ static void handle_probe(struct fio_client *client, struct fio_net_cmd *cmd)
 	sprintf(bit, "%d-bit", probe->bpp * 8);
 	probe->flags = le64_to_cpu(probe->flags);
 
-	log_info("hostname=%s, be=%u, %s, os=%s, arch=%s, fio=%s, flags=%lx\n",
-		probe->hostname, probe->bigendian, bit, os, arch,
-		probe->fio_version, (unsigned long) probe->flags);
+	if (output_format & FIO_OUTPUT_NORMAL) {
+		log_info("hostname=%s, be=%u, %s, os=%s, arch=%s, fio=%s, flags=%lx\n",
+			probe->hostname, probe->bigendian, bit, os, arch,
+			probe->fio_version, (unsigned long) probe->flags);
+	}
 
 	if (!client->name)
 		client->name = strdup((char *) probe->hostname);
@@ -1423,7 +1528,7 @@ static void handle_start(struct fio_client *client, struct fio_net_cmd *cmd)
 	sum_stat_clients += client->nr_stat;
 }
 
-static void handle_stop(struct fio_client *client, struct fio_net_cmd *cmd)
+static void handle_stop(struct fio_client *client)
 {
 	if (client->error)
 		log_info("client <%s>: exited with error %d\n", client->hostname, client->error);
@@ -1452,7 +1557,7 @@ static struct cmd_iolog_pdu *convert_iolog_gz(struct fio_net_cmd *cmd,
 #ifdef CONFIG_ZLIB
 	struct cmd_iolog_pdu *ret;
 	z_stream stream;
-	uint32_t nr_samples;
+	uint64_t nr_samples;
 	size_t total;
 	char *p;
 
@@ -1497,6 +1602,11 @@ static struct cmd_iolog_pdu *convert_iolog_gz(struct fio_net_cmd *cmd,
 		err = inflate(&stream, Z_NO_FLUSH);
 		/* may be Z_OK, or Z_STREAM_END */
 		if (err < 0) {
+			/*
+			 * Z_STREAM_ERROR and Z_BUF_ERROR can safely be
+			 * ignored */
+			if (err == Z_STREAM_ERROR || err == Z_BUF_ERROR)
+				break;
 			log_err("fio: inflate error %d\n", err);
 			free(ret);
 			ret = NULL;
@@ -1573,7 +1683,7 @@ static struct cmd_iolog_pdu *convert_iolog(struct fio_net_cmd *cmd,
 		s->time		= le64_to_cpu(s->time);
 		s->data.val	= le64_to_cpu(s->data.val);
 		s->__ddir	= le32_to_cpu(s->__ddir);
-		s->bs		= le32_to_cpu(s->bs);
+		s->bs		= le64_to_cpu(s->bs);
 
 		if (ret->log_offset) {
 			struct io_sample_offset *so = (void *) s;
@@ -1647,6 +1757,8 @@ int fio_handle_client(struct fio_client *client)
 	dprint(FD_NET, "client: got cmd op %s from %s (pdu=%u)\n",
 		fio_server_op(cmd->opcode), client->hostname, cmd->pdu_len);
 
+	client->last_cmd = cmd->opcode;
+
 	switch (cmd->opcode) {
 	case FIO_NET_CMD_QUIT:
 		if (ops->quit)
@@ -1670,7 +1782,7 @@ int fio_handle_client(struct fio_client *client)
 		struct cmd_ts_pdu *p = (struct cmd_ts_pdu *) cmd->payload;
 
 		dprint(FD_NET, "client: ts->ss_state = %u\n", (unsigned int) le32_to_cpu(p->ts.ss_state));
-		if (le32_to_cpu(p->ts.ss_state) & __FIO_SS_DATA) {
+		if (le32_to_cpu(p->ts.ss_state) & FIO_SS_DATA) {
 			dprint(FD_NET, "client: received steadystate ring buffers\n");
 
 			size = le64_to_cpu(p->ts.ss_dur);
@@ -1724,7 +1836,7 @@ int fio_handle_client(struct fio_client *client)
 		client->state = Client_stopped;
 		client->error = le32_to_cpu(pdu->error);
 		client->signal = le32_to_cpu(pdu->signal);
-		ops->stop(client, cmd);
+		ops->stop(client);
 		break;
 		}
 	case FIO_NET_CMD_ADD_JOB: {
@@ -1813,6 +1925,9 @@ static void request_client_etas(struct client_ops *ops)
 	struct client_eta *eta;
 	int skipped = 0;
 
+	if (eta_print == FIO_ETA_NEVER)
+		return;
+
 	dprint(FD_NET, "client: request eta (%d)\n", nr_clients);
 
 	eta = calloc(1, sizeof(*eta) + __THREAD_RUNSTR_SZ(REAL_MAX_JOBS));
@@ -1849,10 +1964,12 @@ static void request_client_etas(struct client_ops *ops)
 static int handle_cmd_timeout(struct fio_client *client,
 			      struct fio_net_cmd_reply *reply)
 {
+	uint16_t reply_opcode = reply->opcode;
+
 	flist_del(&reply->list);
 	free(reply);
 
-	if (reply->opcode != FIO_NET_CMD_SEND_ETA)
+	if (reply_opcode != FIO_NET_CMD_SEND_ETA)
 		return 1;
 
 	log_info("client <%s>: timeout on SEND_ETA\n", client->hostname);
@@ -1880,16 +1997,19 @@ static int client_check_cmd_timeout(struct fio_client *client,
 	int ret = 0;
 
 	flist_for_each_safe(entry, tmp, &client->cmd_list) {
+		unsigned int op;
+
 		reply = flist_entry(entry, struct fio_net_cmd_reply, list);
 
 		if (mtime_since(&reply->ts, now) < FIO_NET_CLIENT_TIMEOUT)
 			continue;
 
+		op = reply->opcode;
 		if (!handle_cmd_timeout(client, reply))
 			continue;
 
 		log_err("fio: client %s, timeout on cmd %s\n", client->hostname,
-						fio_server_op(reply->opcode));
+						fio_server_op(op));
 		ret = 1;
 	}
 
@@ -1919,7 +2039,10 @@ static int fio_check_clients_timed_out(void)
 		else
 			log_err("fio: client %s timed out\n", client->hostname);
 
-		client->error = ETIMEDOUT;
+		if (client->last_cmd != FIO_NET_CMD_VTRIGGER)
+			client->error = ETIMEDOUT;
+		else
+			log_info("fio: ignoring timeout due to vtrigger\n");
 		remove_client(client);
 		ret = 1;
 	}
@@ -1968,7 +2091,7 @@ int fio_handle_clients(struct client_ops *ops)
 			int timeout;
 
 			fio_gettime(&ts, NULL);
-			if (mtime_since(&eta_ts, &ts) >= 900) {
+			if (eta_time_within_slack(mtime_since(&eta_ts, &ts))) {
 				request_client_etas(ops);
 				memcpy(&eta_ts, &ts, sizeof(ts));
 
@@ -2010,8 +2133,17 @@ int fio_handle_clients(struct client_ops *ops)
 		}
 	}
 
+	log_info_buf(allclients.buf, allclients.buflen);
+	buf_output_free(&allclients);
+
 	fio_client_json_fini();
 
 	free(pfds);
 	return retval || error_clients;
+}
+
+static void client_display_thread_status(struct jobs_eta *je)
+{
+	if (!(output_format & FIO_OUTPUT_JSON))
+		display_thread_status(je);
 }
